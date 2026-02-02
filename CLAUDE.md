@@ -32,6 +32,7 @@ When creating a new release, ALWAYS build separate binaries for each architectur
 ### Release Notes Format
 
 Title should be: Swiss Railway Clock {version_major}.{version_minor}
+
 Include:
 - Summary of changes
 - Download instructions specifying which DMG for which Mac type:
