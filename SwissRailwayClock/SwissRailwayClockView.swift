@@ -14,6 +14,9 @@ class SwissRailwayClockView: ScreenSaverView {
     // causing high CPU/RAM usage. We track state to force exit when needed.
     private var hasStartedAnimation = false
     private var stopAnimationCalled = false
+    private var watchdogTimer: Timer?
+    private var lastAnimationTime: Date?
+    private var isFullScreenMode = false  // True only when running as actual screensaver
 
     // MARK: - Initialization
 
@@ -62,6 +65,93 @@ class SwissRailwayClockView: ScreenSaverView {
             name: NSWindow.willCloseNotification,
             object: nil
         )
+
+        // Listen for system screensaver stop notifications
+        // willstop fires BEFORE the screensaver stops - gives us time to clean up
+        DistributedNotificationCenter.default().addObserver(
+            self,
+            selector: #selector(screenSaverWillStop),
+            name: NSNotification.Name("com.apple.screensaver.willstop"),
+            object: nil
+        )
+        DistributedNotificationCenter.default().addObserver(
+            self,
+            selector: #selector(screenSaverDidStop),
+            name: NSNotification.Name("com.apple.screensaver.didstop"),
+            object: nil
+        )
+
+        // Note: Watchdog timer is started later in startAnimation() after we can
+        // detect if we're in full-screen mode vs preview in System Settings
+    }
+
+    private func startWatchdogTimer() {
+        watchdogTimer?.invalidate()
+        watchdogTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            self?.watchdogCheck()
+        }
+    }
+
+    @objc private func watchdogCheck() {
+        // Skip checks if we haven't started or not in full-screen mode
+        guard hasStartedAnimation, isFullScreenMode else { return }
+
+        var shouldExit = false
+
+        // Check 1: If animation hasn't run in 5 seconds, we're likely orphaned
+        if let lastTime = lastAnimationTime, Date().timeIntervalSince(lastTime) > 5.0 {
+            shouldExit = true
+        }
+
+        // Check 2: Window is no longer visible or doesn't exist
+        if self.window == nil {
+            shouldExit = true
+        } else if let window = self.window {
+            // Check 3: Window is not visible on any screen
+            if !window.isVisible || window.occlusionState.contains(.visible) == false {
+                shouldExit = true
+            }
+
+            // Check 4: Window alpha is zero (invisible)
+            if window.alphaValue <= 0 {
+                shouldExit = true
+            }
+        }
+
+        if shouldExit {
+            // In full-screen mode, force exit as last resort
+            // (normal teardown via notifications should have already happened)
+            cleanupAndExit()
+        }
+    }
+
+    @objc private func screenSaverWillStop(_ notification: Notification) {
+        // System notified that screensaver is about to stop
+        // On macOS 14.0+ (Sonoma), perform cleanup to prevent lingering process
+        if #available(macOS 14.0, *) {
+            teardown()
+        }
+    }
+
+    @objc private func screenSaverDidStop(_ notification: Notification) {
+        // System notified that screensaver stopped
+        // On macOS 14.0+ (Sonoma), ensure cleanup happened
+        if #available(macOS 14.0, *) {
+            teardown()
+        }
+    }
+
+    /// Clean up resources to allow process to exit naturally (Sonoma fix)
+    private func teardown() {
+        watchdogTimer?.invalidate()
+        watchdogTimer = nil
+        clockAnimator.stop()
+
+        // Clear cached resources
+        clockRenderer = nil
+
+        // Remove from view hierarchy
+        self.removeFromSuperview()
     }
 
     @objc private func applicationWillTerminate(_ notification: Notification) {
@@ -69,22 +159,26 @@ class SwissRailwayClockView: ScreenSaverView {
     }
 
     @objc private func windowWillClose(_ notification: Notification) {
-        // Only respond to our own window closing
+        // Respond to our own window closing
         if let closingWindow = notification.object as? NSWindow,
            closingWindow == self.window {
-            cleanupAndExit()
+            if #available(macOS 14.0, *) {
+                teardown()
+            }
         }
     }
 
+    /// Force exit - only used by watchdog when normal cleanup doesn't work
     private func cleanupAndExit() {
-        clockAnimator.stop()
-        // Force exit to work around Sonoma's legacyScreenSaver bug
-        // where the process doesn't terminate properly
+        teardown()
+        // Force exit as last resort when process won't terminate naturally
         exit(0)
     }
 
     deinit {
+        watchdogTimer?.invalidate()
         NotificationCenter.default.removeObserver(self)
+        DistributedNotificationCenter.default().removeObserver(self)
     }
 
     private func detectIfMainDisplay() -> Bool {
@@ -97,6 +191,27 @@ class SwissRailwayClockView: ScreenSaverView {
         return myID == mainID
     }
 
+    /// Determines if we're running as actual full-screen screensaver (not preview in Settings)
+    private func detectFullScreenMode() -> Bool {
+        guard let window = self.window, let screen = window.screen else {
+            return false
+        }
+
+        // Check if window covers the entire screen (full-screen screensaver)
+        let windowFrame = window.frame
+        let screenFrame = screen.frame
+
+        // Allow small tolerance for frame comparison
+        let tolerance: CGFloat = 10
+        let coversScreen = abs(windowFrame.width - screenFrame.width) < tolerance &&
+                          abs(windowFrame.height - screenFrame.height) < tolerance
+
+        // Also check window level - screensaver windows have a high level
+        let hasScreenSaverLevel = window.level.rawValue >= NSWindow.Level.screenSaver.rawValue
+
+        return coversScreen && hasScreenSaverLevel
+    }
+
     // MARK: - ScreenSaverView Lifecycle
 
     override func startAnimation() {
@@ -104,6 +219,17 @@ class SwissRailwayClockView: ScreenSaverView {
         hasStartedAnimation = true
         stopAnimationCalled = false
         clockAnimator.start()
+
+        // Detect full-screen mode after a short delay (window needs to be set up)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self = self else { return }
+            self.isFullScreenMode = self.detectFullScreenMode()
+
+            // Only start watchdog for actual full-screen screensaver
+            if self.isFullScreenMode {
+                self.startWatchdogTimer()
+            }
+        }
     }
 
     override func stopAnimation() {
@@ -111,9 +237,10 @@ class SwissRailwayClockView: ScreenSaverView {
         stopAnimationCalled = true
         clockAnimator.stop()
 
-        // Force exit to work around macOS Sonoma's legacyScreenSaver bug
-        // Without this, the process continues running invisibly, consuming CPU/RAM
-        cleanupAndExit()
+        // On macOS 14.0+ (Sonoma), perform cleanup to help process exit
+        if #available(macOS 14.0, *) {
+            teardown()
+        }
     }
 
     override func draw(_ rect: NSRect) {
@@ -146,12 +273,16 @@ class SwissRailwayClockView: ScreenSaverView {
     }
 
     override func animateOneFrame() {
-        // Check if we should exit (Sonoma bug workaround)
-        // If animation started but view is no longer in a valid state, exit
-        if hasStartedAnimation && !isPreview {
+        // Track animation timing for watchdog
+        lastAnimationTime = Date()
+
+        // Check if we should clean up (Sonoma bug workaround)
+        if hasStartedAnimation {
             // Check if window is gone or view is hidden
-            if window == nil || isHiddenOrHasHiddenAncestor || !isDescendant(of: window?.contentView ?? self) {
-                cleanupAndExit()
+            if window == nil || isHiddenOrHasHiddenAncestor {
+                if #available(macOS 14.0, *) {
+                    teardown()
+                }
                 return
             }
         }
